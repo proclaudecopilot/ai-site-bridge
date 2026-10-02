@@ -84,6 +84,16 @@ curl -s -H "X-Site-Bridge-Token: $TOKEN" "https://example.com/wp-json/site-bridg
 - `/render` ползва временна (5 минути) auth бисквитка само за вътрешната заявка на сървъра към самия себе си. Може да се изключи отделно.
 - Аварийно: `define('SITE_BRIDGE_DISABLED', true)` в `wp-config.php` или просто деактивирайте плъгина.
 
+## Обновления
+
+Плъгинът се обновява сам от този GitHub repo (клон `main`). WordPress проверява версията в хедъра на `site-bridge.php` на всеки 6 часа и при разлика показва обновление в **Плъгини → Обновления**, както при всеки друг плъгин. Бутон „Провери сега“ има в Настройки → Site Bridge.
+
+За да излезе ново обновление на сайтовете: вдигнете `Version:` в `site-bridge.php` (и константата `SITE_BRIDGE_VERSION`), допишете ред в „Промени“ по-долу и push-нете в `main`. Хедърите `GitHub Plugin URI` / `Primary Branch` правят плъгина съвместим и с Git Updater, ако някой сайт го ползва.
+
+## Промени
+
+- 1.0.0 — първа версия: info, plugins, constants, options, posts/post, meta, oxygen, users, cron, hooks, errors, health, log, file, ls, sql, render; админ екран; `bin/sb`; самообновяване от GitHub.
+
 ## Изисквания
 
 PHP 7.4+, WordPress 5.8+. Не зависи от Oxygen; детекцията на builders е best effort и суровото meta винаги е достъпно през `/post/{id}`.

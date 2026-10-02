@@ -86,6 +86,11 @@ class SB_Admin {
 				SB_Errors::clear();
 				$redirect = add_query_arg( 'sb_msg', 'errors', $redirect );
 				break;
+
+			case 'check_update':
+				SB_Updater::check_now();
+				$redirect = add_query_arg( 'sb_msg', 'update', $redirect );
+				break;
 		}
 		wp_safe_redirect( $redirect );
 		exit;
@@ -117,6 +122,8 @@ class SB_Admin {
 				<div class="notice notice-success is-dismissible"><p>Токенът е анулиран.</p></div>
 			<?php elseif ( $msg === 'log' || $msg === 'errors' ) : ?>
 				<div class="notice notice-success is-dismissible"><p>Изчистено.</p></div>
+			<?php elseif ( $msg === 'update' ) : ?>
+				<div class="notice notice-info is-dismissible"><p>Проверката за обновления е изпълнена.</p></div>
 			<?php endif; ?>
 
 			<?php if ( $new_token ) : ?>
@@ -222,6 +229,31 @@ class SB_Admin {
 				<?php submit_button( 'Анулирай токена', 'delete', 'submit', false ); ?>
 			</form>
 			<?php endif; ?>
+
+			<hr>
+			<h2>Обновления</h2>
+			<?php $remote = SB_Updater::remote_version(); ?>
+			<p>Инсталирана версия: <strong><?php echo esc_html( SITE_BRIDGE_VERSION ); ?></strong>.
+			В GitHub (<code><?php echo esc_html( SB_Updater::REPO ); ?></code>, клон <code><?php echo esc_html( SB_Updater::BRANCH ); ?></code>):
+			<?php if ( ! empty( $remote['version'] ) ) : ?>
+				<strong><?php echo esc_html( $remote['version'] ); ?></strong>
+				<?php if ( version_compare( $remote['version'], SITE_BRIDGE_VERSION, '>' ) ) : ?>
+					— <a href="<?php echo esc_url( admin_url( 'plugins.php' ) ); ?>">има обновление, инсталирайте го от Плъгини</a>.
+				<?php else : ?>
+					— актуално.
+				<?php endif; ?>
+			<?php else : ?>
+				<span style="color:#b32d2e">неизвестна (<?php echo esc_html( $remote['error'] ?? '' ); ?>)</span>
+			<?php endif; ?>
+			<?php if ( ! empty( $remote['checked'] ) ) : ?>
+				<span class="description">Проверено <?php echo esc_html( wp_date( 'd.m.Y H:i', (int) $remote['checked'] ) ); ?>.</span>
+			<?php endif; ?>
+			</p>
+			<form method="post">
+				<?php wp_nonce_field( 'sb_settings' ); ?>
+				<input type="hidden" name="sb_action" value="check_update">
+				<?php submit_button( 'Провери сега', 'secondary', 'submit', false ); ?>
+			</form>
 
 			<hr>
 			<h2>Уловени грешки <small style="font-weight:normal">(<?php echo count( $errors ); ?>)</small></h2>
