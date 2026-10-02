@@ -1,0 +1,5 @@
+.DS_Store
+*.zip
+sites.json
+.idea/
+.vscode/

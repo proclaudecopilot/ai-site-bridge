@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# sb — tiny client for the Site Bridge WordPress plugin.
+#
+#   sb <site> <endpoint> [key=value ...]        GET  (query params)
+#   sb <site> sql "SELECT ..."                  POST /sql
+#   sb <site> render "wp-admin/admin.php?page=x" [as=guest] [format=html]
+#   sb <site> file plugins/foo/bar.php
+#   sb <site> log [lines=300] [grep=Fatal]
+#   sb list                                     show configured sites
+#
+# Site config (first match wins):
+#   1. env SB_<SITE>_URL and SB_<SITE>_TOKEN      (SITE upper-cased, "-" and "." -> "_")
+#   2. $SB_CONFIG or ~/.config/site-bridge/sites.json:
+#        {"shrine": {"url": "https://example.com", "token": "sb_..."}}
+#
+# Options: --raw (no jq pretty print), --text (print only .data when it is a string)
+
+set -euo pipefail
+
+CONFIG="${SB_CONFIG:-$HOME/.config/site-bridge/sites.json}"
+RAW=0; TEXT=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --raw) RAW=1 ;;
+    --text) TEXT=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+die() { echo "sb: $*" >&2; exit 1; }
+have_jq() { command -v jq >/dev/null 2>&1; }
+
+if [[ "${1:-}" == "list" || $# -lt 1 ]]; then
+  echo "From environment:"
+  env | grep -E '^SB_[A-Z0-9_]+_URL=' | sed -E 's/^SB_(.*)_URL=(.*)$/  \1 -> \2/' | tr 'A-Z' 'a-z' || true
+  if [[ -f "$CONFIG" ]] && have_jq; then
+    echo "From $CONFIG:"
+    jq -r 'to_entries[] | "  \(.key) -> \(.value.url)"' "$CONFIG"
+  fi
+  [[ $# -lt 1 ]] && { echo; sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+  exit 0
+fi
+
+SITE="$1"; shift
+EP="${1:-}"; [[ -n "$EP" ]] || die "missing endpoint"; shift || true
+
+KEY="$(echo "$SITE" | tr 'a-z.-' 'A-Z__')"
+URL="$(printenv "SB_${KEY}_URL" 2>/dev/null || true)"
+TOKEN="$(printenv "SB_${KEY}_TOKEN" 2>/dev/null || true)"
+if [[ -z "$URL" && -f "$CONFIG" ]]; then
+  have_jq || die "jq is required to read $CONFIG"
+  URL="$(jq -r --arg s "$SITE" '.[$s].url // empty' "$CONFIG")"
+  TOKEN="$(jq -r --arg s "$SITE" '.[$s].token // empty' "$CONFIG")"
+fi
+[[ -n "$URL" && -n "$TOKEN" ]] || die "no config for site '$SITE' (set SB_${KEY}_URL / SB_${KEY}_TOKEN or add it to $CONFIG)"
+
+URL="${URL%/}"
+BASE="$URL/wp-json/site-bridge/v1"
+# Sites without pretty permalinks:
+[[ "${SB_PLAIN_PERMALINKS:-0}" == "1" ]] && BASE="$URL/?rest_route=/site-bridge/v1"
+
+METHOD=GET; BODY=""; QS=""
+urlenc() { if have_jq; then jq -rn --arg v "$1" '$v|@uri'; else printf '%s' "$1" | sed 's/ /%20/g; s/&/%26/g; s/+/%2B/g; s/#/%23/g; s/?/%3F/g'; fi; }
+add_qs() { QS="${QS:+$QS&}$1=$(urlenc "$2")"; }
+
+case "$EP" in
+  sql)
+    METHOD=POST; Q="${1:-}"; [[ -n "$Q" ]] || die "sql needs a query"; shift || true
+    if have_jq; then BODY="$(jq -cn --arg q "$Q" '{query:$q}')"; else BODY="{\"query\":\"${Q//\"/\\\"}\"}"; fi
+    EP="sql" ;;
+  render)
+    METHOD=POST; P="${1:-}"; [[ -n "$P" ]] || die "render needs a path"; shift || true
+    AS="admin"; FMT="text"; MAX=""
+    for kv in "$@"; do case "$kv" in as=*) AS="${kv#as=}";; format=*) FMT="${kv#format=}";; max=*) MAX="${kv#max=}";; esac; done
+    set --
+    if have_jq; then BODY="$(jq -cn --arg p "$P" --arg a "$AS" --arg f "$FMT" --arg m "$MAX" '{path:$p,as:$a,format:$f} + (if $m != "" then {max:($m|tonumber)} else {} end)')"
+    else BODY="{\"path\":\"$P\",\"as\":\"$AS\",\"format\":\"$FMT\"}"; fi
+    TEXT=1; EP="render" ;;
+  file) P="${1:-}"; [[ -n "$P" ]] || die "file needs a path"; shift || true; add_qs path "$P"; TEXT=1 ;;
+  ls)   P="${1:-wp-content}"; if [[ "$P" != *=* ]]; then shift || true; else P="wp-content"; fi; add_qs path "$P" ;;
+  log)  for kv in "$@"; do [[ "$kv" == *=* ]] || kv="lines=$kv"; add_qs "${kv%%=*}" "${kv#*=}"; done; set -- ;;
+  post) ID="${1:-}"; [[ -n "$ID" ]] || die "post needs an id"; shift || true; EP="post/$ID" ;;
+  hooks) H="${1:-}"; [[ -n "$H" && "$H" != *=* ]] && { add_qs hook "$H"; shift || true; } ;;
+  options) [[ -n "${1:-}" && "$1" != *=* ]] && { add_qs name "$1"; shift || true; } ;;
+  errors-clear) METHOD=DELETE; EP="errors" ;;
+esac
+for kv in "$@"; do [[ "$kv" == *=* ]] && add_qs "${kv%%=*}" "${kv#*=}"; done
+
+EP="${EP#/}"
+if [[ "$BASE" == *"rest_route="* ]]; then FULL="$BASE/$EP${QS:+&$QS}"; else FULL="$BASE/$EP${QS:+?$QS}"; fi
+
+CURL=(curl -sS -m 90 -H "X-Site-Bridge-Token: $TOKEN" -H "Accept: application/json" -X "$METHOD")
+[[ -n "$BODY" ]] && CURL+=(-H "Content-Type: application/json" --data "$BODY")
+RESP="$("${CURL[@]}" "$FULL")" || die "request failed: $FULL"
+
+if [[ $RAW == 1 ]] || ! have_jq; then printf '%s\n' "$RESP"; exit 0; fi
+if [[ $TEXT == 1 ]] && jq -e '.data|type=="string"' >/dev/null 2>&1 <<<"$RESP"; then
+  jq -r 'del(.data) | to_entries | map("\(.key)=\(.value|tostring)") | join("  ")' <<<"$RESP" >&2
+  jq -r '.data' <<<"$RESP"
+else
+  jq . <<<"$RESP"
+fi
