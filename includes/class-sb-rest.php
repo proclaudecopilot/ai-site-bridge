@@ -170,6 +170,9 @@ class SB_REST {
 					'db_server'   => method_exists( $wpdb, 'db_server_info' ) ? $wpdb->db_server_info() : null,
 					'site_bridge' => SITE_BRIDGE_VERSION,
 				),
+				'security'    => array(
+					'php2shell' => SB_PHP2Shell::status(), // CVE-2026-109618 / CVE-2026-109619: state, fixed_in, session_upload_progress…
+				),
 				'server'      => array(
 					'software'           => $_SERVER['SERVER_SOFTWARE'] ?? '',
 					'os'                 => PHP_OS,

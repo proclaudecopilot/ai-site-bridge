@@ -18,7 +18,7 @@ Everything is read-only. Secrets (passwords, salts, keys, tokens, licenses) are 
 Route list, plugin version, which optional features (`files`, `sql`, `render`) are enabled.
 
 ### `GET /info`
-`site` (urls, locale, timezone, environment, permalinks), `versions` (WP, PHP, MySQL), `server` (memory, time limits, error_log, disabled functions, extensions), `debug` (WP_DEBUG & friends), `paths` (ABSPATH, content dir, debug.log path + exists + size, file scope), `db` (prefix, name, host), `theme`, `plugins` (active only), `mu_plugins`, `dropins`, `builders` (Oxygen/Breakdance/Elementor/Bricks version constants), `post_types` (counts by status), `taxonomies`, `users_total`, `errors_captured`.
+`site` (urls, locale, timezone, environment, permalinks), `versions` (WP, PHP, MySQL), `security.php2shell` (CVE-2026-109618 / CVE-2026-109619: `state` patched|vulnerable|eol|unknown, `fixed_in`, `session_upload_progress`, `fatal_error_backtraces`, `post_max_size` — проверка само по номер на версията), `server` (memory, time limits, error_log, disabled functions, extensions), `debug` (WP_DEBUG & friends), `paths` (ABSPATH, content dir, debug.log path + exists + size, file scope), `db` (prefix, name, host), `theme`, `plugins` (active only), `mu_plugins`, `dropins`, `builders` (Oxygen/Breakdance/Elementor/Bricks version constants), `post_types` (counts by status), `taxonomies`, `users_total`, `errors_captured`.
 
 ### `GET /plugins`
 All installed plugins: `file`, `slug`, `name`, `version`, `active`, `network`, `update` (new version if pending), `requires`.

@@ -57,7 +57,7 @@ curl -s -H "X-Site-Bridge-Token: $TOKEN" "https://example.com/wp-json/site-bridg
 | Маршрут | Какво връща |
 |---|---|
 | `GET /` | списък с маршрути и кои функции са включени |
-| `GET /info` | версии, debug константи, пътища, тема, активни плъгини, builders, брой постове по тип |
+| `GET /info` | версии, php2shell статус (`security.php2shell`: закърпен ли е PHP срещу CVE-2026-109618 / CVE-2026-109619), debug константи, пътища, тема, активни плъгини, builders, брой постове по тип |
 | `GET /plugins` | всички плъгини, активни/неактивни, чакащи обновления |
 | `GET /constants` | дефинираните константи, тайните са скрити |
 | `GET /options` | опции по име или по префикс, unserialize-нати, тайните скрити |
@@ -92,6 +92,7 @@ curl -s -H "X-Site-Bridge-Token: $TOKEN" "https://example.com/wp-json/site-bridg
 
 ## Промени
 
+- 1.0.1 — php2shell (CVE-2026-109618 / CVE-2026-109619, критичен RCE в самия PHP, поправен в 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12): `GET /info` връща `security.php2shell` (състояние по номер на версията, `session.upload_progress.enabled`, `fatal_error_backtraces`, `post_max_size`), известие в админа + тест в Състояние на сайта, докато PHP не е обновен; ред със статуса на екрана Настройки. Плъгинът не може да закърпи PHP — само показва и съветва (backport без смяна на номера не се вижда).
 - 1.0.0 — първа версия: info, plugins, constants, options, posts/post, meta, oxygen, users, cron, hooks, errors, health, log, file, ls, sql, render; админ екран; `bin/sb`; самообновяване от GitHub.
 
 ## Изисквания

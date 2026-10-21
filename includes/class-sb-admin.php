@@ -115,6 +115,8 @@ class SB_Admin {
 		<div class="wrap">
 			<h1>Site Bridge <small style="font-weight:normal;color:#666">v<?php echo esc_html( SITE_BRIDGE_VERSION ); ?></small></h1>
 			<p class="description">Read-only REST API, през което AI асистент може да чете състоянието на сайта (информация, опции, постове и meta, Oxygen данни, логове, файлове, SELECT заявки, рендерирани админ страници). Нищо не се записва през него.</p>
+			<?php $p2s = SB_PHP2Shell::status(); ?>
+			<p>PHP <code><?php echo esc_html( $p2s['php'] ); ?></code> (<?php echo esc_html( $p2s['sapi'] ); ?>) · php2shell (CVE-2026-109618 / CVE-2026-109619): <?php echo $p2s['patched'] ? '<b style="color:#1a7f37">✓ закърпен</b>' : '<b style="color:#b32d2e">⚠ уязвим</b> — вижте известието най-горе'; ?>. Същото е в <code>GET /info → security.php2shell</code>.</p>
 
 			<?php if ( $msg === 'saved' ) : ?>
 				<div class="notice notice-success is-dismissible"><p>Настройките са запазени.</p></div>
