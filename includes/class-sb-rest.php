@@ -65,6 +65,25 @@ class SB_REST {
 				'permission_callback' => $auth,
 			)
 		);
+
+		/* ---------- write layer (only when allow_write is on) ---------- */
+
+		$write = SB_Auth::feature_check( 'write' );
+
+		register_rest_route( $ns, '/write/post', array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'create_post' ), 'permission_callback' => $write ) );
+		register_rest_route(
+			$ns,
+			'/write/post/(?P<id>\d+)',
+			array(
+				array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'update_post' ), 'permission_callback' => $write ),
+				array( 'methods' => 'DELETE', 'callback' => array( 'SB_Write', 'delete_post' ), 'permission_callback' => $write ),
+			)
+		);
+		register_rest_route( $ns, '/write/meta', array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'meta' ), 'permission_callback' => $write ) );
+		register_rest_route( $ns, '/write/option', array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'option' ), 'permission_callback' => $write ) );
+		register_rest_route( $ns, '/write/code-block', array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'code_block' ), 'permission_callback' => $write ) );
+		register_rest_route( $ns, '/write/file', array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'file' ), 'permission_callback' => $write ) );
+		register_rest_route( $ns, '/write/undo/(?P<id>[A-Za-z0-9.]+)', array( 'methods' => 'POST', 'callback' => array( 'SB_Write', 'undo' ), 'permission_callback' => $write ) );
 	}
 
 	/* ------------------------------------------------------------------ helpers */
@@ -95,9 +114,11 @@ class SB_REST {
 				'version'  => SITE_BRIDGE_VERSION,
 				'site'     => home_url(),
 				'features' => array(
-					'files'  => (bool) $s['allow_files'],
-					'sql'    => (bool) $s['allow_sql'],
-					'render' => (bool) $s['allow_render'],
+					'files'       => (bool) $s['allow_files'],
+					'sql'         => (bool) $s['allow_sql'],
+					'render'      => (bool) $s['allow_render'],
+					'write'       => (bool) $s['allow_write'],
+					'write_files' => (bool) $s['allow_write_files'],
 				),
 				'routes'   => array(
 					'GET  /info'                    => 'Versions, debug flags, paths, theme, active plugins, builders.',
@@ -120,7 +141,16 @@ class SB_REST {
 					'GET  /ls?path='                => 'List a directory.',
 					'POST /sql {query, limit}'      => 'Run a single SELECT/SHOW/DESCRIBE/EXPLAIN. {prefix} is replaced.',
 					'POST /render {path, as, format, max}' => 'Fetch a front-end or wp-admin page as admin, return text or HTML.',
+					'POST   /write/post {title, content, status, type, meta}' => 'WRITE: create a post. Needs the "write" feature.',
+					'POST   /write/post/{id} {title, content, status, ...}'   => 'WRITE: update a post\'s fields.',
+					'DELETE /write/post/{id}?force=1'      => 'WRITE: trash (or force-delete) a post.',
+					'POST   /write/meta {post_id, key, value, json, raw, delete}' => 'WRITE: set or delete one post meta key.',
+					'POST   /write/option {name, value, json, autoload, delete}'  => 'WRITE: set or delete one option.',
+					'POST   /write/code-block {post_id, element_id, php, css, js, meta_key}' => 'WRITE: replace code of one Oxygen code block.',
+					'POST   /write/file {path, content}'   => 'WRITE: write a file on disk. Needs the "write_files" feature.',
+					'POST   /write/undo/{id}'              => 'WRITE: restore the snapshot of an earlier write (undo_id from any write response).',
 				),
+				'write_enabled' => (bool) $s['allow_write'],
 			)
 		);
 	}

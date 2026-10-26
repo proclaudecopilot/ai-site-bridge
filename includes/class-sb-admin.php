@@ -56,6 +56,8 @@ class SB_Admin {
 						'allow_files'      => ! empty( $_POST['allow_files'] ),
 						'allow_sql'        => ! empty( $_POST['allow_sql'] ),
 						'allow_render'     => ! empty( $_POST['allow_render'] ),
+						'allow_write'      => ! empty( $_POST['allow_write'] ),
+						'allow_write_files' => ! empty( $_POST['allow_write_files'] ),
 						'capture_warnings' => ! empty( $_POST['capture_warnings'] ),
 						'log_requests'     => ! empty( $_POST['log_requests'] ),
 						'render_user'      => (int) ( $_POST['render_user'] ?? 0 ),
@@ -80,6 +82,21 @@ class SB_Admin {
 			case 'clear_log':
 				SB_Auth::clear_log();
 				$redirect = add_query_arg( 'sb_msg', 'log', $redirect );
+				break;
+
+			case 'clear_write_log':
+				SB_Auth::clear_write_log();
+				$redirect = add_query_arg( 'sb_msg', 'wlog', $redirect );
+				break;
+
+			case 'undo_write':
+				$wid = isset( $_POST['write_id'] ) ? sanitize_text_field( wp_unslash( $_POST['write_id'] ) ) : '';
+				if ( $wid !== '' ) {
+					$req = new WP_REST_Request( 'POST' );
+					$req->set_param( 'id', $wid );
+					$res = SB_Write::undo( $req );
+					$redirect = add_query_arg( 'sb_msg', is_wp_error( $res ) ? 'undo_err' : 'undo_ok', $redirect );
+				}
 				break;
 
 			case 'clear_errors':
@@ -111,6 +128,7 @@ class SB_Admin {
 		$admins    = get_users( array( 'role' => 'administrator', 'orderby' => 'ID' ) );
 		$errors    = SB_Errors::all();
 		$log       = SB_Auth::get_log();
+		$wlog      = SB_Auth::get_write_log();
 		?>
 		<div class="wrap">
 			<h1>Site Bridge <small style="font-weight:normal;color:#666">v<?php echo esc_html( SITE_BRIDGE_VERSION ); ?></small></h1>
@@ -120,10 +138,14 @@ class SB_Admin {
 				<div class="notice notice-success is-dismissible"><p>Настройките са запазени.</p></div>
 			<?php elseif ( $msg === 'revoked' ) : ?>
 				<div class="notice notice-success is-dismissible"><p>Токенът е анулиран.</p></div>
-			<?php elseif ( $msg === 'log' || $msg === 'errors' ) : ?>
+			<?php elseif ( $msg === 'log' || $msg === 'errors' || $msg === 'wlog' ) : ?>
 				<div class="notice notice-success is-dismissible"><p>Изчистено.</p></div>
 			<?php elseif ( $msg === 'update' ) : ?>
 				<div class="notice notice-info is-dismissible"><p>Проверката за обновления е изпълнена.</p></div>
+			<?php elseif ( $msg === 'undo_ok' ) : ?>
+				<div class="notice notice-success is-dismissible"><p>Промяната е върната.</p></div>
+			<?php elseif ( $msg === 'undo_err' ) : ?>
+				<div class="notice notice-error is-dismissible"><p>Промяната не можа да бъде върната (вижте журнала).</p></div>
 			<?php endif; ?>
 
 			<?php if ( $new_token ) : ?>
@@ -198,6 +220,15 @@ class SB_Admin {
 								</select>
 							</label>
 							<p class="description">При <code>/render</code> плъгинът прави вътрешна HTTP заявка към собствения сайт с временна (5 мин.) auth бисквитка на избрания администратор и връща страницата като текст. Това показва на асистента точно това, което виждате вие в админа.</p>
+						</td>
+					</tr>
+					<tr>
+						<th scope="row">Писане (управление)</th>
+						<td>
+							<label><input type="checkbox" name="allow_write" value="1" <?php checked( $s['allow_write'] ); ?>> <strong>Разреши писане</strong> — асистентът може да създава и променя постове, meta, опции и Oxygen код блокове (<code>/write/*</code>)</label>
+							<p class="description" style="color:#b32d2e">Това вече <strong>не</strong> е само за четене. Включвайте го само докато работите заедно с асистента и го изключвайте след това. Всяка промяна се записва в „Журнал на промените“ по-долу и може да се върне с <code>/write/undo/{id}</code>.</p>
+							<label style="margin-left:24px"><input type="checkbox" name="allow_write_files" value="1" <?php checked( $s['allow_write_files'] ); ?>> Разреши и писане на <strong>файлове</strong> на диска (<code>/write/file</code>)</label>
+							<p class="description" style="margin-left:24px">Отделно и по-опасно. Спазва същия обхват като четенето на файлове (wp-content или цялата инсталация), а <code>wp-config.php</code>, <code>.env</code>, <code>*.pem</code>, <code>*.key</code> остават забранени.</p>
 						</td>
 					</tr>
 					<tr>
@@ -280,6 +311,43 @@ class SB_Admin {
 				</form>
 			<?php else : ?>
 				<p>Няма записани грешки.</p>
+			<?php endif; ?>
+
+			<hr>
+			<h2>Журнал на промените <small style="font-weight:normal">(<?php echo count( $wlog ); ?>)</small></h2>
+			<p class="description">Всяка промяна, направена през <code>/write/*</code>. Стойността отпреди промяната се пази, затова всеки ред може да се върне обратно (освен окончателно изтрит пост).</p>
+			<?php if ( $wlog ) : ?>
+				<table class="widefat striped">
+					<thead><tr><th>Кога</th><th>Действие</th><th>Цел</th><th>Какво</th><th>Статус</th><th></th></tr></thead>
+					<tbody>
+					<?php foreach ( array_slice( $wlog, 0, SB_Auth::WLOG_MAX ) as $w ) : ?>
+						<tr>
+							<td><?php echo esc_html( wp_date( 'd.m H:i:s', (int) $w['time'] ) ); ?></td>
+							<td><code><?php echo esc_html( $w['action'] ?? '' ); ?></code></td>
+							<td><?php echo esc_html( $w['target'] ?? '' ); ?></td>
+							<td style="max-width:420px;word-break:break-word"><?php echo esc_html( $w['summary'] ?? '' ); ?></td>
+							<td><?php echo ! empty( $w['undone'] ) ? '<span style="color:#996800">върнато</span>' : '<span style="color:#0a7">активно</span>'; ?></td>
+							<td>
+								<?php if ( empty( $w['undone'] ) && empty( $w['before_omitted'] ) && ( $w['action'] ?? '' ) !== 'undo' && ( $w['action'] ?? '' ) !== 'delete_post' && ! empty( $w['before'] ) ) : ?>
+									<form method="post" onsubmit="return confirm('Да върна ли тази промяна?')">
+										<?php wp_nonce_field( 'sb_settings' ); ?>
+										<input type="hidden" name="sb_action" value="undo_write">
+										<input type="hidden" name="write_id" value="<?php echo esc_attr( $w['id'] ?? '' ); ?>">
+										<?php submit_button( 'Върни', 'small', 'submit', false ); ?>
+									</form>
+								<?php endif; ?>
+							</td>
+						</tr>
+					<?php endforeach; ?>
+					</tbody>
+				</table>
+				<form method="post" style="margin-top:8px" onsubmit="return confirm('Изчистване на журнала? Снимките за връщане ще се загубят.')">
+					<?php wp_nonce_field( 'sb_settings' ); ?>
+					<input type="hidden" name="sb_action" value="clear_write_log">
+					<?php submit_button( 'Изчисти журнала на промените', 'secondary', 'submit', false ); ?>
+				</form>
+			<?php else : ?>
+				<p>Още няма промени.</p>
 			<?php endif; ?>
 
 			<hr>

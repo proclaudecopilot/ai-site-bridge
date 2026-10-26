@@ -64,6 +64,54 @@ class SB_Paths {
 		return new WP_Error( 'sb_path_outside', 'Path does not exist or is outside the allowed directories (' . implode( ', ', self::roots() ) . ').', array( 'status' => 404 ) );
 	}
 
+	/**
+	 * Resolve a path for writing. The file need not exist yet, but its parent
+	 * directory must exist and sit inside an allowed root, and the basename must
+	 * not be on the deny list.
+	 *
+	 * @return string|WP_Error  Absolute normalized target path.
+	 */
+	public static function resolve_writable( string $path ) {
+		$path = trim( $path );
+		if ( $path === '' || strpos( $path, "\0" ) !== false ) {
+			return new WP_Error( 'sb_bad_path', 'Empty or invalid path.', array( 'status' => 400 ) );
+		}
+		$path = str_replace( '\\', '/', $path );
+		if ( strpos( $path, '..' ) !== false ) {
+			return new WP_Error( 'sb_bad_path', 'Path traversal ("..") is not allowed.', array( 'status' => 400 ) );
+		}
+
+		// Build the candidate absolute paths exactly like resolve() does.
+		$candidates = array();
+		if ( $path[0] === '/' || preg_match( '/^[A-Za-z]:\//', $path ) ) {
+			$candidates[] = $path;
+		} else {
+			$candidates[] = self::norm( ABSPATH ) . '/' . ltrim( $path, '/' );
+			$candidates[] = self::norm( WP_CONTENT_DIR ) . '/' . ltrim( $path, '/' );
+			$candidates[] = self::norm( WP_PLUGIN_DIR ) . '/' . ltrim( $path, '/' );
+		}
+
+		foreach ( $candidates as $c ) {
+			$parent     = dirname( $c );
+			$parent_real = realpath( $parent );
+			if ( $parent_real === false ) {
+				continue; // Parent directory must already exist.
+			}
+			$parent_real = str_replace( '\\', '/', $parent_real );
+			$target      = $parent_real . '/' . basename( $c );
+			foreach ( self::roots() as $root ) {
+				if ( $parent_real === $root || strpos( $parent_real, $root . '/' ) === 0 ) {
+					$deny = self::denied( $target );
+					if ( $deny ) {
+						return $deny;
+					}
+					return $target;
+				}
+			}
+		}
+		return new WP_Error( 'sb_path_outside', 'The target directory does not exist or is outside the allowed directories (' . implode( ', ', self::roots() ) . ').', array( 'status' => 404 ) );
+	}
+
 	private static function denied( string $real ) {
 		$base = basename( $real );
 		if ( in_array( $base, self::DENY_BASENAMES, true ) ) {

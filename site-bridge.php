@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Site Bridge
  * Plugin URI:  https://github.com/proclaudecopilot/ai-site-bridge
- * Description: Read-only REST API that lets an AI assistant inspect this site (info, options, posts & meta, Oxygen data, logs, files, SELECT queries, rendered admin pages) while you work on other plugins. Nothing is ever written through it.
- * Version:     1.0.0
+ * Description: REST API that lets an AI assistant inspect this site (info, options, posts & meta, Oxygen data, logs, files, SELECT queries, rendered admin pages) and — when you switch on the "write" feature — make changes for you: posts, meta, options, Oxygen code blocks and files, each change reversible from an audit log.
+ * Version:     2.0.0
  * Requires PHP: 7.4
  * Requires at least: 5.8
  * Author:      proclaudecopilot
@@ -16,7 +16,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'SITE_BRIDGE_VERSION', '1.0.0' );
+define( 'SITE_BRIDGE_VERSION', '2.0.0' );
 define( 'SITE_BRIDGE_FILE', __FILE__ );
 define( 'SITE_BRIDGE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SITE_BRIDGE_NS', 'site-bridge/v1' );
@@ -26,6 +26,7 @@ require_once SITE_BRIDGE_DIR . 'includes/class-sb-auth.php';
 require_once SITE_BRIDGE_DIR . 'includes/class-sb-errors.php';
 require_once SITE_BRIDGE_DIR . 'includes/class-sb-paths.php';
 require_once SITE_BRIDGE_DIR . 'includes/class-sb-oxygen.php';
+require_once SITE_BRIDGE_DIR . 'includes/class-sb-write.php';
 require_once SITE_BRIDGE_DIR . 'includes/class-sb-rest.php';
 require_once SITE_BRIDGE_DIR . 'includes/class-sb-admin.php';
 require_once SITE_BRIDGE_DIR . 'includes/class-sb-updater.php';
