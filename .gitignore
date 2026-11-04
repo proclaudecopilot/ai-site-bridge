@@ -1,5 +1,8 @@
-.DS_Store
+*.pyc
 *.zip
-sites.json
+.DS_Store
 .idea/
 .vscode/
+__pycache__/
+sb-migrate-state.json
+sites.json
