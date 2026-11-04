@@ -100,11 +100,12 @@ class Bridge:
 class WpRest:
     """WordPress core REST client (Application Password)."""
 
-    def __init__(self, http, rest_base, user, password):
+    def __init__(self, http, rest_base, user, password, auth_header='Authorization'):
         self.http = http
         self.base = rest_base.rstrip('/')
         tok = base64.b64encode(f'{user}:{password}'.encode()).decode()
-        self.auth = {'Authorization': 'Basic ' + tok}
+        # auth_header lets a tiny mu-plugin re-inject the credentials when the web server strips Authorization
+        self.auth = {auth_header: 'Basic ' + tok}
 
     def _url(self, route, params=None):
         sep = '&' if '?' in self.base else '?'
@@ -388,6 +389,7 @@ def main():
     ap.add_argument('--target-user')
     ap.add_argument('--target-pass', help='Application Password of --target-user')
     ap.add_argument('--target-token', help="target's Site Bridge token (needed for Elementor/builder meta)")
+    ap.add_argument('--target-auth-header', default='Authorization', help='header carrying the Basic credentials (default Authorization)')
     ap.add_argument('--target-plain-permalinks', action='store_true')
     ap.add_argument('--type', default='post')
     ap.add_argument('--status', default='publish', help='comma list of source statuses to copy (default publish)')
@@ -437,7 +439,7 @@ def main():
         ap.error('--target-url, --target-user and --target-pass are required (or use --wxr)')
     cat_map = json.load(open(a.category_map)) if a.category_map else {}
     src_tz = src.get('/info')['data']['site'].get('timezone') or '+00:00'
-    wp = WpRest(http, a.target_rest or a.target_url.rstrip('/') + '/wp-json', a.target_user or '', a.target_pass or '')
+    wp = WpRest(http, a.target_rest or a.target_url.rstrip('/') + '/wp-json', a.target_user or '', a.target_pass or '', a.target_auth_header)
     if a.target_user and a.target_pass:
         me = wp.get('/wp/v2/users/me', context='edit')
         log(f'Target {a.target_url}: authenticated as {me.get("name")} ({me.get("slug")})')
