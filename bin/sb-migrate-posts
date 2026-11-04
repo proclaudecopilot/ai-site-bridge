@@ -69,11 +69,14 @@ class Http:
 class Bridge:
     """Site Bridge client."""
 
-    def __init__(self, http, url, token, plain_permalinks=False):
+    def __init__(self, http, url, token, plain_permalinks=False, rest_base=None):
         self.http, self.token = http, token
         url = url.rstrip('/')
-        self.base = url + ('/?rest_route=/site-bridge/v1' if plain_permalinks else '/wp-json/site-bridge/v1')
-        self.plain = plain_permalinks
+        if rest_base:
+            self.base = rest_base.rstrip('/') + '/site-bridge/v1'
+        else:
+            self.base = url + ('/?rest_route=/site-bridge/v1' if plain_permalinks else '/wp-json/site-bridge/v1')
+        self.plain = plain_permalinks or '?' in self.base
 
     def _url(self, route, params=None):
         q = urllib.parse.urlencode(params or {})
@@ -196,6 +199,54 @@ def fetch_bytes(http, url):
     if status != 200:
         raise RuntimeError(f'GET {url} -> {status}')
     return data
+
+
+def elementor_to_html(data):
+    """Flatten an Elementor tree (text-editor / heading / image / button / html widgets) into plain HTML."""
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return ''
+    parts = []
+
+    def walk(nodes):
+        for n in nodes or []:
+            if n.get('elType') == 'widget':
+                st = n.get('settings') or {}
+                wt = n.get('widgetType')
+                if wt == 'text-editor':
+                    parts.append(st.get('editor', ''))
+                elif wt == 'heading':
+                    tag = st.get('header_size') or 'h2'
+                    parts.append(f'<{tag}>{st.get("title", "")}</{tag}>')
+                elif wt == 'image':
+                    img = st.get('image') or {}
+                    if img.get('url'):
+                        parts.append(f'<figure class="wp-block-image"><img src="{img["url"]}" alt="{escape(img.get("alt", "") or "")}" /></figure>')
+                elif wt == 'button':
+                    link = (st.get('link') or {}).get('url')
+                    if link and st.get('text'):
+                        align = st.get('align') or 'left'
+                        parts.append(f'<p style="text-align:{align}"><a class="button wp-block-button__link" href="{link}">{st["text"]}</a></p>')
+                elif wt == 'html':
+                    parts.append(st.get('html', ''))
+            walk(n.get('elements'))
+
+    walk(data)
+    html = '\n'.join(parts)
+    html = re.sub(r'<!--\s*/?wp:[^>]*-->', '', html)           # Gutenberg block comments copied into Elementor
+    html = re.sub(r'<p>(?:\s|&nbsp;)*</p>', '', html)            # empty paragraphs left behind
+    return re.sub(r'\n{3,}', '\n\n', html).strip()
+
+
+def to_gmt(local, offset):
+    """'YYYY-MM-DD HH:MM:SS' in site-local time + offset '+03:00' -> ISO-8601 GMT."""
+    import datetime
+    m = re.match(r'([+-])(\d\d):(\d\d)', offset or '')
+    delta = datetime.timedelta(hours=int(m.group(2)), minutes=int(m.group(3))) * (1 if m.group(1) == '+' else -1) if m else datetime.timedelta()
+    dt = datetime.datetime.strptime(local, '%Y-%m-%d %H:%M:%S') - delta
+    return dt.strftime('%Y-%m-%dT%H:%M:%S')
 
 
 # ---------- target side ----------
@@ -344,6 +395,7 @@ def main():
     ap.add_argument('--target-status', help='force this status on the target (default: keep the source status)')
     ap.add_argument('--unpublish-source', action='store_true', help='set copied source posts to draft afterwards (needs write enabled on the source bridge)')
     ap.add_argument('--state', default='sb-migrate-state.json')
+    ap.add_argument('--category-map', help='JSON file: {"<source id>": ["Target cat", ...], "names": {"Source cat": "Target cat"}}')
     ap.add_argument('--wxr', help='write a WordPress importer (WXR) file instead of pushing to a target')
     ap.add_argument('--dry-run', action='store_true')
     a = ap.parse_args()
@@ -381,12 +433,17 @@ def main():
         write_wxr(posts, a.source_url, a.wxr)
         return
 
-    if not (a.target_url and a.target_user and a.target_pass):
+    if not a.target_url or (not a.dry_run and not (a.target_user and a.target_pass)):
         ap.error('--target-url, --target-user and --target-pass are required (or use --wxr)')
-    wp = WpRest(http, a.target_rest or a.target_url.rstrip('/') + '/wp-json', a.target_user, a.target_pass)
-    me = wp.get('/wp/v2/users/me', context='edit')
-    log(f'Target {a.target_url}: authenticated as {me.get("name")} ({me.get("slug")})')
-    tgt_bridge = Bridge(http, a.target_url, a.target_token, a.target_plain_permalinks) if a.target_token else None
+    cat_map = json.load(open(a.category_map)) if a.category_map else {}
+    src_tz = src.get('/info')['data']['site'].get('timezone') or '+00:00'
+    wp = WpRest(http, a.target_rest or a.target_url.rstrip('/') + '/wp-json', a.target_user or '', a.target_pass or '')
+    if a.target_user and a.target_pass:
+        me = wp.get('/wp/v2/users/me', context='edit')
+        log(f'Target {a.target_url}: authenticated as {me.get("name")} ({me.get("slug")})')
+    else:
+        log(f'Target {a.target_url}: dry run without credentials (categories are looked up anonymously)')
+    tgt_bridge = Bridge(http, a.target_url, a.target_token, a.target_plain_permalinks, a.target_rest) if a.target_token else None
     target_has_elementor = False
     if tgt_bridge:
         info = tgt_bridge.get('/info')['data']
@@ -405,7 +462,8 @@ def main():
             continue
         log(f'> {p["id"]} {p["title"][:70]}')
         # categories
-        cat_ids = [c for c in (ensure_category(wp, cat_cache, c['name'], a.dry_run) for c in p['categories']) if c]
+        names = cat_map.get(key) or [cat_map.get('names', {}).get(c['name'], c['name']) for c in p['categories']]
+        cat_ids = [c for c in (ensure_category(wp, cat_cache, n, a.dry_run) for n in names) if c]
         # images
         texts = p['content'] + (p['elementor']['_elementor_data'] if p['elementor'] else '')
         urls = find_image_urls(texts, a.source_url)
@@ -425,10 +483,12 @@ def main():
             m = ensure_media(wp, http, state, p['thumbnail']['url'], p['thumbnail']['alt'], p['thumbnail']['title'], a.dry_run)
             save_state()
             featured = m['id'] if m else None
-        content = rewrite_urls(p['content'], mapping)
+        use_elementor = bool(p['elementor'] and tgt_bridge and target_has_elementor)
+        raw_content = p['content'] if (use_elementor or not p['elementor']) else (elementor_to_html(p['elementor']['_elementor_data']) or p['content'])
+        content = rewrite_urls(raw_content, mapping)
         body = {
             'title': p['title'], 'content': content, 'excerpt': p['excerpt'],
-            'status': a.target_status or p['status'], 'date': p['date'].replace(' ', 'T'),
+            'status': a.target_status or p['status'], 'date_gmt': to_gmt(p['date'], src_tz),
             'categories': cat_ids,
         }
         if p['slug']:
@@ -436,14 +496,14 @@ def main():
         if featured:
             body['featured_media'] = featured
         if a.dry_run:
-            log(f'  [dry-run] would create {body["status"]} post "{p["title"][:50]}" cats={cat_ids} featured={featured} images={len(urls)} elementor={bool(p["elementor"])}')
+            log(f'  [dry-run] would create {body["status"]} post "{p["title"][:50]}" cats={names} featured={bool(p["thumbnail"])} images={len(urls)} elementor={"meta" if use_elementor else ("flattened" if p["elementor"] else "no")} bytes={len(content)}')
             continue
         created = wp.post('/wp/v2/posts', body)
         tid = created['id']
         done[key] = {'target_id': tid, 'target_link': created.get('link'), 'title': p['title']}
         save_state()
         log(f'  + post -> {tid} {created.get("link")}')
-        if p['elementor'] and tgt_bridge and target_has_elementor:
+        if use_elementor:
             ed = rewrite_urls(p['elementor']['_elementor_data'], mapping)
             for k, v in p['elementor'].items():
                 if k == '_elementor_data':
@@ -460,7 +520,7 @@ def main():
     if a.unpublish_source:
         for p in posts:
             key = str(p['id'])
-            if p['status'] != 'publish' or not done.get(key, {}).get('target_id'):
+            if p['status'] != 'publish' or not (a.dry_run or done.get(key, {}).get('target_id')):
                 continue
             if done[key].get('source_unpublished'):
                 continue
