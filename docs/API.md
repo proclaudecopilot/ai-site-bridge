@@ -133,6 +133,9 @@ bin/sb-migrate-posts ... --status publish --unpublish-source   # copy, then draf
 bin/sb-migrate-posts --source-url https://a.bg --source-token sb_... --status publish,draft --wxr export.xml
 ```
 
+`--image-name-fix OLD=NEW` retries an image whose name 404s with the replacement undone (for sites where a word
+was replaced in the content, file names included). `--target-auth-header X-Name` sends the credentials in another
+header for hosts that strip `Authorization` (pair it with a tiny mu-plugin that copies it to `PHP_AUTH_USER/PW`).
 `--wxr` writes a WordPress importer file (Tools → Import → WordPress, tick "Download and import file
 attachments") when no Application Password is available. `--ids 1,2` selects specific posts,
 `--target-status draft` overrides the status on the target.
