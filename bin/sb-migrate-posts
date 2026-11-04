@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Copy posts from one WordPress site to another and (optionally) unpublish them at the source.
+
+Source  : read through Site Bridge (GET /posts, /post/{id}); unpublish through POST /write/post/{id}.
+Target  : WordPress core REST API with an Application Password (media upload, categories,
+          featured image, post create) plus, optionally, the target's Site Bridge token for
+          builder meta (`_elementor_data` & co.) which core REST does not expose.
+
+Images referenced in the content (and the featured image) are downloaded from the source
+and uploaded to the target; every URL (plain or percent-encoded, any -WxH size variant)
+is rewritten to the new location. Runs are idempotent: progress is kept in --state.
+
+Examples
+  bin/sb-migrate-posts --source-url https://a.bg --source-token sb_... \
+      --target-url https://b.bg --target-user admin --target-pass 'xxxx xxxx xxxx' \
+      --target-token sb_... --status publish --dry-run
+  bin/sb-migrate-posts ... --ids 3097,3237 --unpublish-source
+  bin/sb-migrate-posts --source-url https://a.bg --source-token sb_... --wxr export.xml   # WordPress importer file
+Only the Python standard library is used.
+"""
+import argparse, base64, json, mimetypes, os, re, sys, time, urllib.parse, urllib.request, urllib.error
+from xml.sax.saxutils import escape
+
+SIZE_RE = re.compile(r'-\d+x\d+(?=\.(?:jpe?g|png|gif|webp)$)', re.I)
+ELEMENTOR_KEYS = ('_elementor_data', '_elementor_edit_mode', '_elementor_template_type', '_elementor_version', '_elementor_pro_version', '_elementor_page_settings')
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+class Http:
+    def __init__(self, timeout=120):
+        self.timeout = timeout
+
+    def call(self, method, url, headers=None, data=None, json_body=None, retries=3):
+        headers = dict(headers or {})
+        body = None
+        if json_body is not None:
+            body = json.dumps(json_body, ensure_ascii=False).encode('utf-8')
+            headers['Content-Type'] = 'application/json; charset=utf-8'
+        elif data is not None:
+            body = data
+        for attempt in range(retries):
+            req = urllib.request.Request(url, data=body, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read()
+                    ctype = resp.headers.get('Content-Type', '')
+                    return resp.status, (json.loads(raw) if 'json' in ctype else raw)
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = raw[:500].decode('utf-8', 'replace')
+                if e.code in (429, 502, 503, 504) and attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return e.code, payload
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise
+        raise RuntimeError('unreachable')
+
+
+class Bridge:
+    """Site Bridge client."""
+
+    def __init__(self, http, url, token, plain_permalinks=False):
+        self.http, self.token = http, token
+        url = url.rstrip('/')
+        self.base = url + ('/?rest_route=/site-bridge/v1' if plain_permalinks else '/wp-json/site-bridge/v1')
+        self.plain = plain_permalinks
+
+    def _url(self, route, params=None):
+        q = urllib.parse.urlencode(params or {})
+        if self.plain:
+            return self.base + route + ('&' + q if q else '')
+        return self.base + route + ('?' + q if q else '')
+
+    def get(self, route, **params):
+        status, data = self.http.call('GET', self._url(route, params), {'X-Site-Bridge-Token': self.token})
+        if status != 200 or not isinstance(data, dict) or not data.get('ok'):
+            raise RuntimeError(f'Site Bridge GET {route} failed ({status}): {str(data)[:300]}')
+        return data
+
+    def post(self, route, body):
+        status, data = self.http.call('POST', self._url(route), {'X-Site-Bridge-Token': self.token}, json_body=body)
+        if status != 200 or not isinstance(data, dict) or not data.get('ok'):
+            raise RuntimeError(f'Site Bridge POST {route} failed ({status}): {str(data)[:300]}')
+        return data
+
+
+class WpRest:
+    """WordPress core REST client (Application Password)."""
+
+    def __init__(self, http, rest_base, user, password):
+        self.http = http
+        self.base = rest_base.rstrip('/')
+        tok = base64.b64encode(f'{user}:{password}'.encode()).decode()
+        self.auth = {'Authorization': 'Basic ' + tok}
+
+    def _url(self, route, params=None):
+        sep = '&' if '?' in self.base else '?'
+        q = urllib.parse.urlencode(params or {})
+        return self.base + route + (sep + q if q else '')
+
+    def get(self, route, **params):
+        status, data = self.http.call('GET', self._url(route, params), self.auth)
+        if status != 200:
+            raise RuntimeError(f'WP GET {route} failed ({status}): {str(data)[:300]}')
+        return data
+
+    def post(self, route, body):
+        status, data = self.http.call('POST', self._url(route), self.auth, json_body=body)
+        if status not in (200, 201):
+            raise RuntimeError(f'WP POST {route} failed ({status}): {str(data)[:300]}')
+        return data
+
+    def upload(self, route, filename, content, mime):
+        boundary = '----sbmigrate' + hex(int(time.time() * 1000))[2:]
+        head = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                f'Content-Type: {mime}\r\n\r\n').encode('utf-8')
+        body = head + content + f'\r\n--{boundary}--\r\n'.encode()
+        headers = dict(self.auth)
+        headers['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+        headers['Content-Disposition'] = 'attachment; filename="' + urllib.parse.quote(filename) + '"'
+        status, data = self.http.call('POST', self._url(route), headers, data=body)
+        if status not in (200, 201):
+            raise RuntimeError(f'WP upload {filename} failed ({status}): {str(data)[:300]}')
+        return data
+
+
+# ---------- source side ----------
+
+def meta_value(meta, key, default=None):
+    v = meta.get(key)
+    if isinstance(v, dict) and 'value' in v:
+        return v['value']
+    if isinstance(v, list) and v and isinstance(v[0], dict) and 'value' in v[0]:
+        return v[0]['value']
+    return default if v is None else v
+
+
+def collect_post(src, site_url, pid):
+    p = src.get(f'/post/{pid}')['data']
+    meta = p.get('meta') or {}
+    cats = (p.get('terms') or {}).get('category') or {}
+    tags = (p.get('terms') or {}).get('post_tag') or {}
+    elementor = None
+    if meta_value(meta, '_elementor_edit_mode') == 'builder' and meta_value(meta, '_elementor_data'):
+        ed = meta_value(meta, '_elementor_data')
+        elementor = {k: meta_value(meta, k) for k in ELEMENTOR_KEYS if meta_value(meta, k) is not None}
+        elementor['_elementor_data'] = ed if isinstance(ed, str) else json.dumps(ed, ensure_ascii=False)
+    thumb = None
+    tid = meta_value(meta, '_thumbnail_id')
+    if tid:
+        try:
+            a = src.get(f'/post/{int(tid)}', content=0)['data']
+            am = a.get('meta') or {}
+            f = meta_value(am, '_wp_attached_file')
+            if f:
+                thumb = {'id': int(tid), 'url': site_url.rstrip('/') + '/wp-content/uploads/' + f,
+                         'alt': meta_value(am, '_wp_attachment_image_alt', '') or '', 'title': a.get('title') or ''}
+        except Exception as e:
+            log(f'  ! featured image {tid} of post {pid}: {e}')
+    return {
+        'id': p['id'], 'title': p.get('title') or '', 'slug': p.get('slug') or '', 'status': p.get('status'),
+        'type': p.get('type'), 'date': p.get('date'), 'modified': p.get('modified'), 'link': p.get('link'),
+        'excerpt': p.get('excerpt') or '', 'content': p.get('content') or '',
+        'categories': [{'id': int(k), 'name': v} for k, v in cats.items()],
+        'tags': [{'id': int(k), 'name': v} for k, v in tags.items()],
+        'thumbnail': thumb, 'elementor': elementor,
+        'seo_description': meta_value(meta, '_yoast_wpseo_metadesc') or meta_value(meta, '_aioseo_description') or '',
+    }
+
+
+def find_image_urls(text, site_url):
+    host = re.escape(site_url.rstrip('/'))
+    pat = re.compile(host + r'/wp-content/uploads/[^"\'\s<>\\)]+?\.(?:jpe?g|png|gif|webp)', re.I)
+    return set(u for u in pat.findall(text.replace('\\/', '/')))
+
+
+def canonical(url):
+    """Decode percent-encoding and strip a -WxH size suffix -> (original_url, is_variant)."""
+    dec = urllib.parse.unquote(url)
+    orig = SIZE_RE.sub('', dec)
+    return orig, orig != dec
+
+
+def fetch_bytes(http, url):
+    status, data = http.call('GET', urllib.parse.quote(url, safe=':/%?=&'), {'User-Agent': 'sb-migrate-posts'})
+    if status != 200:
+        raise RuntimeError(f'GET {url} -> {status}')
+    return data
+
+
+# ---------- target side ----------
+
+def ensure_category(wp, cache, name, dry):
+    key = name.strip().lower()
+    if key in cache:
+        return cache[key]
+    for c in wp.get('/wp/v2/categories', search=name, per_page=100, _fields='id,name,slug'):
+        cache[c['name'].strip().lower()] = c['id']
+    if key in cache:
+        return cache[key]
+    if dry:
+        log(f'  [dry-run] would create category "{name}"')
+        return None
+    c = wp.post('/wp/v2/categories', {'name': name})
+    cache[key] = c['id']
+    log(f'  + category "{name}" -> {c["id"]}')
+    return c['id']
+
+
+def ensure_media(wp, http, state, src_url, alt, title, dry):
+    """Upload one image (by its canonical/original URL). Returns {id, url} or None."""
+    orig, _ = canonical(src_url)
+    media = state.setdefault('media', {})
+    if orig in media:
+        return media[orig]
+    filename = os.path.basename(orig)
+    if dry:
+        log(f'  [dry-run] would upload {filename}')
+        return None
+    try:
+        content = fetch_bytes(http, orig)
+    except Exception as e:
+        if orig != urllib.parse.unquote(src_url):
+            log(f'  ! {filename}: {e}; using the sized variant instead')
+            orig = urllib.parse.unquote(src_url)
+            filename = os.path.basename(orig)
+            content = fetch_bytes(http, orig)
+        else:
+            raise
+    mime = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+    m = wp.upload('/wp/v2/media', filename, content, mime)
+    if alt or title:
+        try:
+            wp.post(f'/wp/v2/media/{m["id"]}', {k: v for k, v in {'alt_text': alt, 'title': title}.items() if v})
+        except Exception as e:
+            log(f'  ! alt/title for media {m["id"]}: {e}')
+    media[orig] = {'id': m['id'], 'url': m['source_url']}
+    log(f'  + media {filename} -> {m["id"]}')
+    return media[orig]
+
+
+def rewrite_urls(text, mapping):
+    """mapping: original decoded URL -> new URL. Replaces decoded, encoded and -WxH forms."""
+    for old, new in mapping.items():
+        host, path = old.split('/wp-content/uploads/', 1)
+        base, ext = os.path.splitext(path)
+        for variant_re in (re.escape(base) + r'(?:-\d+x\d+)?' + re.escape(ext),
+                           re.escape(urllib.parse.quote(base)) + r'(?:-\d+x\d+)?' + re.escape(ext),
+                           re.escape(urllib.parse.quote(base).replace('%', '%25')) + r'(?:-\d+x\d+)?' + re.escape(ext)):
+            text = re.sub(re.escape(host + '/wp-content/uploads/') + variant_re, new, text)
+    return text
+
+
+# ---------- WXR export ----------
+
+def write_wxr(posts, site_url, out, author='admin'):
+    def cdata(s):
+        return '<![CDATA[' + (s or '').replace(']]>', ']]]]><![CDATA[>') + ']]>'
+    items = []
+    next_id = 10 ** 6
+    for p in posts:
+        att_items = []
+        thumb_id = None
+        if p['thumbnail']:
+            next_id += 1
+            thumb_id = next_id
+            u = p['thumbnail']['url']
+            att_items.append(f"""<item>
+<title>{cdata(p['thumbnail']['title'] or os.path.basename(u))}</title><link>{escape(u)}</link>
+<dc:creator>{cdata(author)}</dc:creator><guid isPermaLink="false">{escape(u)}</guid>
+<wp:post_id>{thumb_id}</wp:post_id><wp:post_date>{escape(p['date'])}</wp:post_date><wp:post_date_gmt>{escape(p['date'])}</wp:post_date_gmt>
+<wp:status>inherit</wp:status><wp:post_parent>{p['id']}</wp:post_parent><wp:post_type>attachment</wp:post_type>
+<wp:post_mime_type>{mimetypes.guess_type(u)[0] or 'image/jpeg'}</wp:post_mime_type>
+<wp:attachment_url>{escape(urllib.parse.quote(u, safe=':/%'))}</wp:attachment_url>
+<wp:postmeta><wp:meta_key>_wp_attachment_image_alt</wp:meta_key><wp:meta_value>{cdata(p['thumbnail']['alt'])}</wp:meta_value></wp:postmeta>
+</item>""")
+        cats = ''.join(f'<category domain="category" nicename="{escape(slugify(c["name"]))}">{cdata(c["name"])}</category>' for c in p['categories'])
+        metas = []
+        if thumb_id:
+            metas.append(('_thumbnail_id', str(thumb_id)))
+        if p['elementor']:
+            for k, v in p['elementor'].items():
+                metas.append((k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)))
+        if p['seo_description']:
+            metas.append(('_yoast_wpseo_metadesc', p['seo_description']))
+        meta_xml = ''.join(f'<wp:postmeta><wp:meta_key>{cdata(k)}</wp:meta_key><wp:meta_value>{cdata(v)}</wp:meta_value></wp:postmeta>' for k, v in metas)
+        items.append(f"""<item>
+<title>{cdata(p['title'])}</title><link>{escape(p['link'] or '')}</link><pubDate>{escape(p['date'])}</pubDate>
+<dc:creator>{cdata(author)}</dc:creator><guid isPermaLink="false">{escape(p['link'] or str(p['id']))}</guid>
+<content:encoded>{cdata(p['content'])}</content:encoded><excerpt:encoded>{cdata(p['excerpt'])}</excerpt:encoded>
+<wp:post_id>{p['id']}</wp:post_id><wp:post_date>{escape(p['date'])}</wp:post_date><wp:post_date_gmt>{escape(p['date'])}</wp:post_date_gmt>
+<wp:comment_status>closed</wp:comment_status><wp:ping_status>closed</wp:ping_status>
+<wp:post_name>{escape(p['slug'])}</wp:post_name><wp:status>{escape(p['status'])}</wp:status>
+<wp:post_parent>0</wp:post_parent><wp:menu_order>0</wp:menu_order><wp:post_type>{escape(p['type'])}</wp:post_type>
+<wp:post_password></wp:post_password><wp:is_sticky>0</wp:is_sticky>
+{cats}{meta_xml}
+</item>""")
+        items.extend(att_items)
+    xml = f"""<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:wfw="http://wellformedweb.org/CommentAPI/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:wp="http://wordpress.org/export/1.2/">
+<channel>
+<title>sb-migrate-posts export</title><link>{escape(site_url)}</link><description></description>
+<language>bg-BG</language><wp:wxr_version>1.2</wp:wxr_version><wp:base_site_url>{escape(site_url)}</wp:base_site_url><wp:base_blog_url>{escape(site_url)}</wp:base_blog_url>
+<wp:author><wp:author_id>1</wp:author_id><wp:author_login>{cdata(author)}</wp:author_login><wp:author_email>{cdata('')}</wp:author_email><wp:author_display_name>{cdata(author)}</wp:author_display_name></wp:author>
+{''.join(items)}
+</channel></rss>
+"""
+    with open(out, 'w', encoding='utf-8') as fh:
+        fh.write(xml)
+    log(f'WXR written: {out} ({len(posts)} posts)')
+
+
+def slugify(s):
+    s = re.sub(r'[^\w\s-]', '', s.lower()).strip()
+    return re.sub(r'[\s_]+', '-', s) or 'cat'
+
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--source-url', required=True)
+    ap.add_argument('--source-token', required=True)
+    ap.add_argument('--source-plain-permalinks', action='store_true')
+    ap.add_argument('--target-url', help='target site URL (https://b.bg)')
+    ap.add_argument('--target-rest', help='target REST base if not <url>/wp-json (e.g. https://b.bg/index.php/wp-json)')
+    ap.add_argument('--target-user')
+    ap.add_argument('--target-pass', help='Application Password of --target-user')
+    ap.add_argument('--target-token', help="target's Site Bridge token (needed for Elementor/builder meta)")
+    ap.add_argument('--target-plain-permalinks', action='store_true')
+    ap.add_argument('--type', default='post')
+    ap.add_argument('--status', default='publish', help='comma list of source statuses to copy (default publish)')
+    ap.add_argument('--ids', help='comma list of source post IDs (overrides --status)')
+    ap.add_argument('--target-status', help='force this status on the target (default: keep the source status)')
+    ap.add_argument('--unpublish-source', action='store_true', help='set copied source posts to draft afterwards (needs write enabled on the source bridge)')
+    ap.add_argument('--state', default='sb-migrate-state.json')
+    ap.add_argument('--wxr', help='write a WordPress importer (WXR) file instead of pushing to a target')
+    ap.add_argument('--dry-run', action='store_true')
+    a = ap.parse_args()
+
+    http = Http()
+    src = Bridge(http, a.source_url, a.source_token, a.source_plain_permalinks)
+    state = {}
+    if os.path.exists(a.state):
+        state = json.load(open(a.state))
+
+    def save_state():
+        if not a.dry_run:
+            json.dump(state, open(a.state, 'w'), ensure_ascii=False, indent=1)
+
+    # 1. which posts
+    if a.ids:
+        ids = [int(x) for x in a.ids.split(',') if x.strip()]
+    else:
+        ids, page = [], 1
+        while True:
+            r = src.get('/posts', type=a.type, status=a.status, per_page=200, page=page)
+            ids += [p['id'] for p in r['data']]
+            if page >= int(r.get('pages') or 1):
+                break
+            page += 1
+    log(f'Source {a.source_url}: {len(ids)} post(s) selected')
+
+    posts = []
+    for pid in ids:
+        p = collect_post(src, a.source_url, pid)
+        posts.append(p)
+        log(f'  {p["id"]:>6} {p["status"]:<8} {"elementor" if p["elementor"] else "classic  "} {p["title"][:70]}')
+
+    if a.wxr:
+        write_wxr(posts, a.source_url, a.wxr)
+        return
+
+    if not (a.target_url and a.target_user and a.target_pass):
+        ap.error('--target-url, --target-user and --target-pass are required (or use --wxr)')
+    wp = WpRest(http, a.target_rest or a.target_url.rstrip('/') + '/wp-json', a.target_user, a.target_pass)
+    me = wp.get('/wp/v2/users/me', context='edit')
+    log(f'Target {a.target_url}: authenticated as {me.get("name")} ({me.get("slug")})')
+    tgt_bridge = Bridge(http, a.target_url, a.target_token, a.target_plain_permalinks) if a.target_token else None
+    target_has_elementor = False
+    if tgt_bridge:
+        info = tgt_bridge.get('/info')['data']
+        slugs = {pl['slug'] for pl in info.get('plugins', []) if pl.get('active')}
+        target_has_elementor = 'elementor' in slugs
+        log(f'Target Site Bridge ok (WP {info["versions"]["wordpress"]}); Elementor active: {target_has_elementor}')
+    elif any(p['elementor'] for p in posts):
+        log('! Elementor posts found but no --target-token: they will be imported as plain content.')
+
+    cat_cache = {}
+    done = state.setdefault('posts', {})
+    for p in posts:
+        key = str(p['id'])
+        if key in done and done[key].get('target_id'):
+            log(f'= {p["id"]} already copied -> target {done[key]["target_id"]}')
+            continue
+        log(f'> {p["id"]} {p["title"][:70]}')
+        # categories
+        cat_ids = [c for c in (ensure_category(wp, cat_cache, c['name'], a.dry_run) for c in p['categories']) if c]
+        # images
+        texts = p['content'] + (p['elementor']['_elementor_data'] if p['elementor'] else '')
+        urls = find_image_urls(texts, a.source_url)
+        mapping = {}
+        alts = {m.group(2): m.group(1) for m in re.finditer(r'alt=\\?"([^"\\]*)\\?"[^>]*src=\\?"([^"\\]+)', texts)}
+        alts.update({m.group(1): m.group(2) for m in re.finditer(r'src=\\?"([^"\\]+)\\?"[^>]*alt=\\?"([^"\\]*)', texts)})
+        for u in sorted(urls):
+            orig, _ = canonical(u)
+            if orig in mapping:
+                continue
+            m = ensure_media(wp, http, state, u, alts.get(u, ''), '', a.dry_run)
+            save_state()
+            if m:
+                mapping[orig] = m['url']
+        featured = None
+        if p['thumbnail']:
+            m = ensure_media(wp, http, state, p['thumbnail']['url'], p['thumbnail']['alt'], p['thumbnail']['title'], a.dry_run)
+            save_state()
+            featured = m['id'] if m else None
+        content = rewrite_urls(p['content'], mapping)
+        body = {
+            'title': p['title'], 'content': content, 'excerpt': p['excerpt'],
+            'status': a.target_status or p['status'], 'date': p['date'].replace(' ', 'T'),
+            'categories': cat_ids,
+        }
+        if p['slug']:
+            body['slug'] = p['slug']
+        if featured:
+            body['featured_media'] = featured
+        if a.dry_run:
+            log(f'  [dry-run] would create {body["status"]} post "{p["title"][:50]}" cats={cat_ids} featured={featured} images={len(urls)} elementor={bool(p["elementor"])}')
+            continue
+        created = wp.post('/wp/v2/posts', body)
+        tid = created['id']
+        done[key] = {'target_id': tid, 'target_link': created.get('link'), 'title': p['title']}
+        save_state()
+        log(f'  + post -> {tid} {created.get("link")}')
+        if p['elementor'] and tgt_bridge and target_has_elementor:
+            ed = rewrite_urls(p['elementor']['_elementor_data'], mapping)
+            for k, v in p['elementor'].items():
+                if k == '_elementor_data':
+                    continue
+                tgt_bridge.post('/write/meta', {'post_id': tid, 'key': k, 'value': v if isinstance(v, str) else json.dumps(v, ensure_ascii=False), 'raw': 1})
+            r = tgt_bridge.post('/write/meta', {'post_id': tid, 'key': '_elementor_data', 'value': ed, 'json': 1})
+            done[key]['elementor_undo'] = r.get('undo_id')
+            save_state()
+            log(f'  + elementor meta written (undo {r.get("undo_id")})')
+        if p['seo_description']:
+            done[key]['seo_description'] = p['seo_description']
+            save_state()
+
+    if a.unpublish_source:
+        for p in posts:
+            key = str(p['id'])
+            if p['status'] != 'publish' or not done.get(key, {}).get('target_id'):
+                continue
+            if done[key].get('source_unpublished'):
+                continue
+            if a.dry_run:
+                log(f'  [dry-run] would set source post {p["id"]} to draft')
+                continue
+            r = src.post(f'/write/post/{p["id"]}', {'status': 'draft'})
+            done[key]['source_unpublished'] = True
+            done[key]['source_undo'] = r.get('undo_id')
+            save_state()
+            log(f'  - source {p["id"]} -> draft (undo {r.get("undo_id")})')
+
+    log('Done.')
+    if not a.dry_run:
+        log(json.dumps({k: v for k, v in done.items()}, ensure_ascii=False, indent=1))
+
+
+if __name__ == '__main__':
+    main()

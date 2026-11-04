@@ -113,3 +113,26 @@ Start with `/info` and `/oxygen`; use `/post/{id}` for raw meta, `/log?grep=Fata
 `/render` with `{"path":"wp-admin/admin.php?page=..."}` to see an admin screen as the user sees it,
 and `/sql` for any SELECT. Never assume how a builder stores data on a site: check `/meta/keys?like=ct_%` first.
 ```
+
+## `bin/sb-migrate-posts` — copy posts to another site
+
+Copies posts from a site running Site Bridge to another WordPress site and, optionally, sets the
+originals to draft. Source side: `GET /posts`, `GET /post/{id}`, `POST /write/post/{id}`. Target side:
+WordPress core REST (`wp/v2/media`, `wp/v2/categories`, `wp/v2/posts`) with an Application Password,
+plus the target's Site Bridge `POST /write/meta` for Elementor data. Every image referenced in the
+content and the featured image is downloaded from the source and uploaded to the target; all URLs
+(plain, percent-encoded, `-WxH` variants) are rewritten. Progress is saved in `sb-migrate-state.json`,
+so a rerun skips what is already done. Standard library only.
+
+```
+bin/sb-migrate-posts --source-url https://a.bg --source-token sb_... \
+    --target-url https://b.bg --target-rest https://b.bg/index.php/wp-json \
+    --target-user admin --target-pass 'xxxx xxxx xxxx xxxx' --target-token sb_... \
+    --status publish --dry-run              # preview
+bin/sb-migrate-posts ... --status publish --unpublish-source   # copy, then draft the originals
+bin/sb-migrate-posts --source-url https://a.bg --source-token sb_... --status publish,draft --wxr export.xml
+```
+
+`--wxr` writes a WordPress importer file (Tools → Import → WordPress, tick "Download and import file
+attachments") when no Application Password is available. `--ids 1,2` selects specific posts,
+`--target-status draft` overrides the status on the target.
