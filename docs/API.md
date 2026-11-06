@@ -10,7 +10,7 @@ Auth: header `X-Site-Bridge-Token: <token>` (or `Authorization: Bearer <token>`)
 
 Errors follow the WordPress REST shape: `{ "code": "...", "message": "...", "data": { "status": 401 } }`. Codes: `site_bridge_disabled` (403), `site_bridge_no_token`/`site_bridge_bad_token` (401), `site_bridge_ip` (403), `site_bridge_rate` (429), `site_bridge_feature_off` (403).
 
-Everything is read-only. Secrets (passwords, salts, keys, tokens, licenses) are replaced with `[redacted ...]` wherever they would appear.
+The `GET` routes are read-only; secrets (passwords, salts, keys, tokens, licenses) are replaced with `[redacted ...]` wherever they would appear. The `POST /write/*` routes **do** change the site and are available only when the `write` feature is enabled in settings (and `write_files` for `/write/file`). Every write snapshots the previous value and returns an `undo_id` — see [Write routes](#write-routes).
 
 ## Routes
 
@@ -88,6 +88,36 @@ Body `{"path": "wp-admin/admin.php?page=my-plugin", "as": "admin|guest", "format
 
 Hosts that block loopback requests return `sb_render_http` (502).
 
+## Write routes
+
+All require the `write` feature (Settings → Site Bridge → „Разреши писане“) on top of the usual token/IP/rate checks; without it they return `site_bridge_feature_off` (403). Parameters can be sent as a JSON body or query string. Every successful write returns `{ "ok": true, "wrote": true, "undo_id": "w...", "data": {...} }`; replay the `undo_id` through `POST /write/undo/{id}` to revert it. All writes are also listed under „Журнал на промените“ in the admin screen with an **Undo** button.
+
+**Value encoding** (for `/write/meta` and `/write/option`): by default the `value` is stored as given. `json=1` runs `json_decode` on a string value first (so you can store arrays/objects, e.g. `_elementor_data`). `raw=1` stores the exact string without any decoding. Arrays sent directly in a JSON body are used as-is. WordPress serializes arrays automatically on save.
+
+### `POST /write/post`
+Create a post. Fields: `post_title`/`title`, `post_content`/`content`, `post_excerpt`, `post_status`/`status` (default `draft`), `post_type`/`type` (default `post`), `post_name`/`slug`, `post_parent`, `menu_order`, `post_author`, `post_date`, `page_template`, plus optional `meta` (object of key→value). Returns `id`, `edit_link`, `link`. Undo trashes the created post.
+
+### `POST /write/post/{id}`
+Update an existing post's fields (same field names as create, except `type`/`author`). Only the fields you send change; the previous values of exactly those fields are snapshotted. Returns `id`, `changed`.
+
+### `DELETE /write/post/{id}`
+Trash the post (restorable). `?force=1` deletes permanently (**not** restorable). Returns `id`, `forced`, `restorable`.
+
+### `POST /write/meta`
+Body `{ "post_id", "key", "value", "json": 1, "raw": 1, "delete": 1 }`. Sets or (with `delete`) removes one post meta key. Snapshots every prior value of that key so undo restores it exactly. This is the route for builder templates: `key=_elementor_data value=<json> json=1`, `key=_wfocu_setting`, `key=_funnel_steps`, Oxygen's `key=ct_builder_json`, etc.
+
+### `POST /write/option`
+Body `{ "name", "value", "json": 1, "raw": 1, "autoload": true|false, "delete": 1 }`. Sets or removes one option. The plugin's own options (`site_bridge_settings`, `site_bridge_log`, `site_bridge_write_log`, `site_bridge_errors`) are refused with `sb_protected` (403).
+
+### `POST /write/code-block`
+Body `{ "post_id", "element_id", "php", "css", "js", "meta_key" }`. Replaces only the code parts you send on the Oxygen code block whose id is `element_id` (find it in `/oxygen/code-blocks`). Handles `ct_builder_json` (JSON tree) and `ct_builder_shortcodes` (re-encodes base64); pass `meta_key` to target one, otherwise both are tried. Returns `sb_block_not_found` (404) if the id is not present. For non-Oxygen builders, edit the raw meta via `/write/meta` instead.
+
+### `POST /write/file` (feature: write_files)
+Body `{ "path", "content" }`. Writes a file inside the allowed scope (same roots and deny-list as `/file`; `..` rejected; max 5 MB). Creates the file if the parent directory exists. Returns `path`, `relative`, `bytes`, `created`, `md5`. Undo restores the previous content, or deletes the file if it did not exist before.
+
+### `POST /write/undo/{id}`
+Revert an earlier write by its `undo_id`. Fails with `sb_already_undone` (409), `sb_undo_omitted` (410, snapshot was >1 MB and dropped), `sb_undo_impossible`/`sb_undo_gone` (410) where a revert is not possible.
+
 ## `bin/sb` helper
 
 ```
@@ -97,7 +127,19 @@ bin/sb <site> render "wp-admin/..." [as=guest] [format=html]
 bin/sb <site> file <path> | ls [<path>] | log [lines] [grep=..] | post <id> | hooks <hook> | options <name>
 bin/sb <site> errors-clear
 bin/sb list
+
+# writing (needs the "write" feature on):
+bin/sb <site> set-meta post_id=123 key=_elementor_data value=@layout.json json=1
+bin/sb <site> update-post 123 content=@page.html status=publish
+bin/sb <site> new-post type=wfocu_offer title="Offer" status=draft
+bin/sb <site> set-option name=foo value=@data.json json=1
+bin/sb <site> code-block post_id=123 element_id=abc php=@block.php
+bin/sb <site> write-file plugins/foo/bar.php content=@bar.php
+bin/sb <site> trash-post 123 [force=1]
+bin/sb <site> undo <write-id>
 ```
+
+`value=@file` / `content=@file` read a local file into the request body. Write commands need `jq`.
 
 Config: env `SB_<SITE>_URL` + `SB_<SITE>_TOKEN` (site name upper-cased, `-`/`.` → `_`), or `~/.config/site-bridge/sites.json` (`{"shrine": {"url": "...", "token": "..."}}`, override with `SB_CONFIG`). `SB_PLAIN_PERMALINKS=1` switches to `?rest_route=`. `--raw` disables jq formatting; string payloads (`file`, `render`) print as plain text with the metadata on stderr.
 
@@ -105,11 +147,15 @@ Config: env `SB_<SITE>_URL` + `SB_<SITE>_TOKEN` (site name upper-cased, `-`/`.` 
 
 ```markdown
 ## Live site access (Site Bridge)
-The production/staging sites run the Site Bridge plugin (https://github.com/proclaudecopilot/ai-site-bridge), a read-only REST API.
+The production/staging sites run the Site Bridge plugin (https://github.com/proclaudecopilot/ai-site-bridge), a REST API.
 Credentials are environment secrets: `SB_<SITE>_URL` and `SB_<SITE>_TOKEN`.
 Call it with `curl -H "X-Site-Bridge-Token: $SB_<SITE>_TOKEN" "$SB_<SITE>_URL/wp-json/site-bridge/v1/<route>"`
 or clone the bridge repo and use `bin/sb <site> <route>`.
 Start with `/info` and `/oxygen`; use `/post/{id}` for raw meta, `/log?grep=Fatal` and `/errors` for errors,
 `/render` with `{"path":"wp-admin/admin.php?page=..."}` to see an admin screen as the user sees it,
 and `/sql` for any SELECT. Never assume how a builder stores data on a site: check `/meta/keys?like=ct_%` first.
+The GET routes are read-only. When the user turns on the "write" feature, you can also change the site via
+`/write/meta` (post meta, e.g. `_elementor_data`), `/write/option`, `/write/post`, `/write/code-block` and
+`/write/file`; GET `/` shows whether writing is enabled. Every write returns an `undo_id` you can replay through
+`/write/undo/{id}`. Read the current value before overwriting it, and tell the user what you changed.
 ```
