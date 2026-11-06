@@ -7,9 +7,11 @@ defined( 'ABSPATH' ) || exit;
 
 class SB_Auth {
 
-	const OPT     = 'site_bridge_settings';
-	const LOG_OPT = 'site_bridge_log';
-	const LOG_MAX = 100;
+	const OPT       = 'site_bridge_settings';
+	const LOG_OPT   = 'site_bridge_log';
+	const WLOG_OPT  = 'site_bridge_write_log';
+	const LOG_MAX   = 100;
+	const WLOG_MAX  = 60;
 
 	const HEADER = 'X-Site-Bridge-Token';
 
@@ -25,6 +27,8 @@ class SB_Auth {
 			'allow_files'      => true,
 			'allow_sql'        => true,
 			'allow_render'     => true,
+			'allow_write'      => false, // Master switch for every mutating route.
+			'allow_write_files' => false, // Writing files on disk (separate, extra-dangerous).
 			'capture_warnings' => false,
 			'render_user'      => 0,
 			'file_scope'       => 'content', // 'content' => wp-content only, 'abspath' => whole install.
@@ -260,5 +264,77 @@ class SB_Auth {
 
 	public static function clear_log(): void {
 		delete_option( self::LOG_OPT );
+	}
+
+	/* ---------- write audit log (mutations + undo snapshots) ---------- */
+
+	/**
+	 * Record one mutation. $entry should carry: action, target, summary, and
+	 * optionally a 'before' snapshot that /write/undo can restore. Returns the id.
+	 */
+	public static function write_log( array $entry ): string {
+		$log = get_option( self::WLOG_OPT, array() );
+		if ( ! is_array( $log ) ) {
+			$log = array();
+		}
+		$id            = uniqid( 'w', true );
+		$entry['id']   = $id;
+		$entry['time'] = time();
+		$entry['ip']   = self::client_ip();
+		if ( ! isset( $entry['undone'] ) ) {
+			$entry['undone'] = false;
+		}
+		// Keep the audit option from ballooning: drop snapshots over 1 MB.
+		if ( isset( $entry['before'] ) ) {
+			$sz = strlen( maybe_serialize( $entry['before'] ) );
+			if ( $sz > 1048576 ) {
+				$entry['before_omitted'] = true;
+				$entry['before']         = array( 'omitted' => true, 'bytes' => $sz );
+			}
+		}
+		$log[] = $entry;
+		if ( count( $log ) > self::WLOG_MAX ) {
+			$log = array_slice( $log, -self::WLOG_MAX );
+		}
+		update_option( self::WLOG_OPT, $log, false );
+		return $id;
+	}
+
+	public static function get_write_log(): array {
+		$log = get_option( self::WLOG_OPT, array() );
+		return is_array( $log ) ? array_reverse( $log ) : array();
+	}
+
+	/** Returns the raw (chronological) entry for an id, or null. */
+	public static function write_entry( string $id ): ?array {
+		$log = get_option( self::WLOG_OPT, array() );
+		if ( ! is_array( $log ) ) {
+			return null;
+		}
+		foreach ( $log as $e ) {
+			if ( ( $e['id'] ?? '' ) === $id ) {
+				return $e;
+			}
+		}
+		return null;
+	}
+
+	public static function mark_undone( string $id ): void {
+		$log = get_option( self::WLOG_OPT, array() );
+		if ( ! is_array( $log ) ) {
+			return;
+		}
+		foreach ( $log as &$e ) {
+			if ( ( $e['id'] ?? '' ) === $id ) {
+				$e['undone']    = true;
+				$e['undone_at'] = time();
+			}
+		}
+		unset( $e );
+		update_option( self::WLOG_OPT, $log, false );
+	}
+
+	public static function clear_write_log(): void {
+		delete_option( self::WLOG_OPT );
 	}
 }

@@ -8,6 +8,17 @@
 #   sb <site> log [lines=300] [grep=Fatal]
 #   sb list                                     show configured sites
 #
+# Writing (needs the "write" feature enabled in the plugin settings):
+#   sb <site> set-meta post_id=123 key=_elementor_data value=@layout.json json=1
+#   sb <site> update-post 123 content=@page.html status=publish
+#   sb <site> new-post type=wfocu_offer title="Offer" status=draft
+#   sb <site> set-option name=foo value=@data.json json=1
+#   sb <site> code-block post_id=123 element_id=abc php=@block.php
+#   sb <site> write-file plugins/foo/bar.php content=@bar.php
+#   sb <site> trash-post 123 [force=1]
+#   sb <site> undo <write-id>
+#     (value=@file reads a local file; every write prints an undo_id)
+#
 # Site config (first match wins):
 #   1. env SB_<SITE>_URL and SB_<SITE>_TOKEN      (SITE upper-cased, "-" and "." -> "_")
 #   2. $SB_CONFIG or ~/.config/site-bridge/sites.json:
@@ -85,6 +96,46 @@ case "$EP" in
   hooks) H="${1:-}"; [[ -n "$H" && "$H" != *=* ]] && { add_qs hook "$H"; shift || true; } ;;
   options) [[ -n "${1:-}" && "$1" != *=* ]] && { add_qs name "$1"; shift || true; } ;;
   errors-clear) METHOD=DELETE; EP="errors" ;;
+
+  set-meta|set-option|code-block|new-post)
+    have_jq || die "jq is required for write commands"
+    METHOD=POST
+    case "$EP" in set-meta) EP="write/meta";; set-option) EP="write/option";; code-block) EP="write/code-block";; new-post) EP="write/post";; esac
+    BODY='{}'
+    for kv in "$@"; do
+      [[ "$kv" == *=* ]] || continue
+      k="${kv%%=*}"; v="${kv#*=}"
+      [[ "$v" == @* ]] && v="$(cat "${v#@}")"
+      BODY="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$BODY")"
+    done
+    set -- ;;
+  update-post)
+    have_jq || die "jq is required for write commands"
+    METHOD=POST; ID="${1:-}"; [[ -n "$ID" && "$ID" != *=* ]] || die "update-post needs a post id"; shift || true
+    EP="write/post/$ID"; BODY='{}'
+    for kv in "$@"; do
+      [[ "$kv" == *=* ]] || continue
+      k="${kv%%=*}"; v="${kv#*=}"
+      [[ "$v" == @* ]] && v="$(cat "${v#@}")"
+      BODY="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$BODY")"
+    done
+    set -- ;;
+  write-file)
+    have_jq || die "jq is required for write commands"
+    METHOD=POST; EP="write/file"; BODY='{}'
+    for kv in "$@"; do
+      [[ "$kv" == *=* ]] || { [[ -z "$(jq -r '.path // empty' <<<"$BODY")" ]] && kv="path=$kv" || continue; }
+      k="${kv%%=*}"; v="${kv#*=}"
+      [[ "$v" == @* ]] && v="$(cat "${v#@}")"
+      BODY="$(jq -c --arg k "$k" --arg v "$v" '. + {($k): $v}' <<<"$BODY")"
+    done
+    set -- ;;
+  trash-post)
+    METHOD=DELETE; ID="${1:-}"; [[ -n "$ID" && "$ID" != *=* ]] || die "trash-post needs a post id"; shift || true
+    EP="write/post/$ID" ;;
+  undo)
+    METHOD=POST; ID="${1:-}"; [[ -n "$ID" ]] || die "undo needs a write id"; shift || true
+    EP="write/undo/$ID"; set -- ;;
 esac
 for kv in "$@"; do [[ "$kv" == *=* ]] && add_qs "${kv%%=*}" "${kv#*=}"; done
 
