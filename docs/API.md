@@ -8,7 +8,7 @@ Auth: header `X-Site-Bridge-Token: <token>` (or `Authorization: Bearer <token>`)
 { "ok": true, "count": 3, "data": ... }
 ```
 
-Errors follow the WordPress REST shape: `{ "code": "...", "message": "...", "data": { "status": 401 } }`. Codes: `site_bridge_disabled` (403), `site_bridge_no_token`/`site_bridge_bad_token` (401), `site_bridge_ip` (403), `site_bridge_rate` (429), `site_bridge_feature_off` (403).
+Errors follow the WordPress REST shape: `{ "code": "...", "message": "...", "data": { "status": 401 } }`. Codes: `site_bridge_disabled` (403), `site_bridge_no_token`/`site_bridge_bad_token` (401), `site_bridge_ip` (403), `site_bridge_rate` (429), `site_bridge_auth_blocked` (429 — 10 wrong tokens from one address within 10 minutes), `site_bridge_feature_off` (403).
 
 The `GET` routes are read-only; secrets (passwords, salts, keys, tokens, licenses) are replaced with `[redacted ...]` wherever they would appear. The `POST /write/*` routes **do** change the site and are available only when the `write` feature is enabled in settings (and `write_files` for `/write/file`). Every write snapshots the previous value and returns an `undo_id` — see [Write routes](#write-routes).
 
@@ -90,7 +90,7 @@ Hosts that block loopback requests return `sb_render_http` (502).
 
 ## Write routes
 
-All require the `write` feature (Settings → Site Bridge → „Разреши писане“) on top of the usual token/IP/rate checks; without it they return `site_bridge_feature_off` (403). Parameters can be sent as a JSON body or query string. Every successful write returns `{ "ok": true, "wrote": true, "undo_id": "w...", "data": {...} }`; replay the `undo_id` through `POST /write/undo/{id}` to revert it. All writes are also listed under „Журнал на промените“ in the admin screen with an **Undo** button.
+All require the `write` feature (Settings → Site Bridge → „Разреши писане“) on top of the usual token/IP/rate checks; without it they return `site_bridge_feature_off` (403). Since 2.0.2 the switch is a window: it turns itself off 12 hours (configurable, 0 = never) after the settings were last saved with it on, and a write after that gets the same 403 with a message saying the window has ended — ask the owner to switch it on again. Parameters can be sent as a JSON body or query string. Every successful write returns `{ "ok": true, "wrote": true, "undo_id": "w...", "data": {...} }`; replay the `undo_id` through `POST /write/undo/{id}` to revert it. All writes are also listed under „Журнал на промените“ in the admin screen with an **Undo** button.
 
 **Value encoding** (for `/write/meta` and `/write/option`): by default the `value` is stored as given. `json=1` runs `json_decode` on a string value first (so you can store arrays/objects, e.g. `_elementor_data`). `raw=1` stores the exact string without any decoding. Arrays sent directly in a JSON body are used as-is. WordPress serializes arrays automatically on save.
 

@@ -3,7 +3,7 @@
  * Plugin Name: Site Bridge
  * Plugin URI:  https://github.com/proclaudecopilot/ai-site-bridge
  * Description: REST API that lets an AI assistant inspect this site (info, options, posts & meta, Oxygen data, logs, files, SELECT queries, rendered admin pages) and — when you switch on the "write" feature — make changes for you: posts, meta, options, Oxygen code blocks and files, each change reversible from an audit log.
- * Version:     2.0.1
+ * Version:     2.0.2
  * Requires PHP: 7.4
  * Requires at least: 5.8
  * Author:      proclaudecopilot
@@ -16,7 +16,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'SITE_BRIDGE_VERSION', '2.0.1' );
+define( 'SITE_BRIDGE_VERSION', '2.0.2' );
 define( 'SITE_BRIDGE_FILE', __FILE__ );
 define( 'SITE_BRIDGE_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SITE_BRIDGE_NS', 'site-bridge/v1' );

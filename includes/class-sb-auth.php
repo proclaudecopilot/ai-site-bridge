@@ -29,6 +29,8 @@ class SB_Auth {
 			'allow_render'     => true,
 			'allow_write'      => false, // Master switch for every mutating route.
 			'allow_write_files' => false, // Writing files on disk (separate, extra-dangerous).
+			'write_hours'      => 12,    // 2.0.2: writing switches itself off this many hours after it was last saved on. 0 = never.
+			'write_until'      => 0,     // Unix time the current write window ends (set when the settings are saved).
 			'capture_warnings' => false,
 			'render_user'      => 0,
 			'file_scope'       => 'content', // 'content' => wp-content only, 'abspath' => whole install.
@@ -65,6 +67,69 @@ class SB_Auth {
 			return false;
 		}
 		return (bool) self::setting( 'enabled' );
+	}
+
+	/* ---------- write window (2.0.2) ---------- */
+
+	/**
+	 * Is writing allowed right now? "Разреши писане" is a window, not a permanent state: it closes
+	 * `write_hours` after the settings were last saved with it on, so a forgotten switch (or a token that
+	 * leaked months later) does not leave the site writable forever. When the window has passed, both
+	 * write switches are turned off for real, so the admin screen shows the truth.
+	 */
+	public static function write_active( ?int $now = null ): bool {
+		$s = self::settings();
+		if ( empty( $s['allow_write'] ) ) {
+			return false;
+		}
+		$hours = (int) $s['write_hours'];
+		if ( $hours <= 0 ) {
+			return true; // The owner chose "never switch off".
+		}
+		$now   = $now ?? time();
+		$until = (int) $s['write_until'];
+		if ( $until <= 0 ) {
+			// Switched on before 2.0.2 (no window recorded): start one now instead of cutting work off mid-session.
+			self::update( array( 'write_until' => $now + $hours * HOUR_IN_SECONDS ) );
+			return true;
+		}
+		if ( $now < $until ) {
+			return true;
+		}
+		self::update( array( 'allow_write' => false, 'allow_write_files' => false, 'write_until' => 0 ) );
+		return false;
+	}
+
+	/** Seconds left in the write window; 0 when off, -1 when it never expires. */
+	public static function write_seconds_left( ?int $now = null ): int {
+		$s = self::settings();
+		if ( empty( $s['allow_write'] ) ) {
+			return 0;
+		}
+		if ( (int) $s['write_hours'] <= 0 ) {
+			return -1;
+		}
+		$until = (int) $s['write_until'];
+		return $until > 0 ? max( 0, $until - ( $now ?? time() ) ) : (int) $s['write_hours'] * HOUR_IN_SECONDS;
+	}
+
+	/* ---------- failed-token throttle (2.0.2) ---------- */
+
+	const FAIL_MAX    = 10;  // Wrong tokens from one address ...
+	const FAIL_WINDOW = 600; // ... within this many seconds => that address gets 429 until the window passes.
+
+	private static function fail_key( string $ip ): string {
+		return 'sb_af_' . md5( $ip );
+	}
+
+	public static function auth_blocked( string $ip ): bool {
+		return (int) get_transient( self::fail_key( $ip ) ) >= self::FAIL_MAX;
+	}
+
+	private static function auth_failed( string $ip ): int {
+		$n = (int) get_transient( self::fail_key( $ip ) ) + 1;
+		set_transient( self::fail_key( $ip ), $n, self::FAIL_WINDOW );
+		return $n;
 	}
 
 	public static function has_token(): bool {
@@ -129,6 +194,13 @@ class SB_Auth {
 			return new WP_Error( 'site_bridge_no_token', 'Missing ' . self::HEADER . ' header.', array( 'status' => 401 ) );
 		}
 
+		// 2.0.2: an address that keeps sending wrong tokens is turned away before any hashing or logging
+		// (every wrong token used to rewrite the request-log option — free database writes for anyone).
+		$ip = self::client_ip();
+		if ( self::auth_blocked( $ip ) ) {
+			return new WP_Error( 'site_bridge_auth_blocked', 'Too many invalid tokens from this address. Try again in 10 minutes.', array( 'status' => 429 ) );
+		}
+
 		$ok   = false;
 		$hash = (string) self::setting( 'token_hash' );
 		if ( $hash !== '' && hash_equals( $hash, self::hash( $token ) ) ) {
@@ -138,6 +210,7 @@ class SB_Auth {
 			$ok = true;
 		}
 		if ( ! $ok ) {
+			self::auth_failed( $ip );
 			self::log( $request, 401 );
 			return new WP_Error( 'site_bridge_bad_token', 'Invalid token.', array( 'status' => 401 ) );
 		}
@@ -166,6 +239,19 @@ class SB_Auth {
 			$r = self::check( $request );
 			if ( $r !== true ) {
 				return $r;
+			}
+			if ( 'write' === $feature ) {
+				$was_on = (bool) self::setting( 'allow_write' );
+				if ( ! self::write_active() ) {
+					return new WP_Error(
+						'site_bridge_feature_off',
+						$was_on
+							? 'The write window has ended: writing switched itself off. Ask the site owner to turn "Разреши писане" on again in Site Bridge settings.'
+							: 'The "write" feature is turned off in Site Bridge settings.',
+						array( 'status' => 403 )
+					);
+				}
+				return true;
 			}
 			if ( ! self::setting( 'allow_' . $feature ) ) {
 				return new WP_Error( 'site_bridge_feature_off', sprintf( 'The "%s" feature is turned off in Site Bridge settings.', $feature ), array( 'status' => 403 ) );

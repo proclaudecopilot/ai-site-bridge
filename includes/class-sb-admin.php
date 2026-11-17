@@ -48,8 +48,13 @@ class SB_Admin {
 
 		switch ( $action ) {
 			case 'save':
+				// 2.0.2: saving with "Разреши писане" on (re)starts the write window.
+				$write_on    = ! empty( $_POST['allow_write'] );
+				$write_hours = max( 0, min( 720, (int) ( $_POST['write_hours'] ?? 12 ) ) );
 				SB_Auth::update(
 					array(
+						'write_hours'      => $write_hours,
+						'write_until'      => ( $write_on && $write_hours > 0 ) ? time() + $write_hours * HOUR_IN_SECONDS : 0,
 						'enabled'          => ! empty( $_POST['enabled'] ),
 						'ip_allowlist'     => sanitize_textarea_field( wp_unslash( $_POST['ip_allowlist'] ?? '' ) ),
 						'rate_limit'       => max( 0, (int) ( $_POST['rate_limit'] ?? 120 ) ),
@@ -57,7 +62,7 @@ class SB_Admin {
 						'allow_sql'        => ! empty( $_POST['allow_sql'] ),
 						'allow_render'     => ! empty( $_POST['allow_render'] ),
 						'allow_write'      => ! empty( $_POST['allow_write'] ),
-						'allow_write_files' => ! empty( $_POST['allow_write_files'] ),
+						'allow_write_files' => $write_on && ! empty( $_POST['allow_write_files'] ),
 						'capture_warnings' => ! empty( $_POST['capture_warnings'] ),
 						'log_requests'     => ! empty( $_POST['log_requests'] ),
 						'render_user'      => (int) ( $_POST['render_user'] ?? 0 ),
@@ -117,6 +122,7 @@ class SB_Admin {
 		if ( ! current_user_can( 'manage_options' ) ) {
 			return;
 		}
+		SB_Auth::write_active(); // 2.0.2: an expired write window is closed before the switches are shown.
 		$s         = SB_Auth::settings();
 		$new_token = get_transient( 'sb_new_token_' . get_current_user_id() );
 		if ( $new_token ) {
@@ -227,6 +233,18 @@ class SB_Admin {
 						<td>
 							<label><input type="checkbox" name="allow_write" value="1" <?php checked( $s['allow_write'] ); ?>> <strong>Разреши писане</strong> — асистентът може да създава и променя постове, meta, опции и Oxygen код блокове (<code>/write/*</code>)</label>
 							<p class="description" style="color:#b32d2e">Това вече <strong>не</strong> е само за четене. Включвайте го само докато работите заедно с асистента и го изключвайте след това. Всяка промяна се записва в „Журнал на промените“ по-долу и може да се върне с <code>/write/undo/{id}</code>.</p>
+							<p>
+								<label>Писането се изключва само след <input type="number" name="write_hours" min="0" max="720" value="<?php echo esc_attr( (int) $s['write_hours'] ); ?>" class="small-text"> часа</label>
+								<span class="description">(0 = не се изключва само). Всяко „Запази“ с включено писане започва срока отначало.</span>
+								<?php
+								$sb_left = SB_Auth::write_seconds_left();
+								if ( $sb_left > 0 ) {
+									echo '<br><strong style="color:#b32d2e">Писането е включено още ' . esc_html( human_time_diff( time(), time() + $sb_left ) ) . '.</strong>';
+								} elseif ( -1 === $sb_left ) {
+									echo '<br><strong style="color:#b32d2e">Писането е включено без срок.</strong>';
+								}
+								?>
+							</p>
 							<label style="margin-left:24px"><input type="checkbox" name="allow_write_files" value="1" <?php checked( $s['allow_write_files'] ); ?>> Разреши и писане на <strong>файлове</strong> на диска (<code>/write/file</code>)</label>
 							<p class="description" style="margin-left:24px">Отделно и по-опасно. Спазва същия обхват като четенето на файлове (wp-content или цялата инсталация), а <code>wp-config.php</code>, <code>.env</code>, <code>*.pem</code>, <code>*.key</code> остават забранени.</p>
 						</td>
