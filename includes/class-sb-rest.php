@@ -129,6 +129,7 @@ class SB_REST {
 	/* ------------------------------------------------------------------ routes */
 
 	public static function index( WP_REST_Request $r ) {
+		SB_Auth::write_active(); // 2.0.2: closes an expired write window before the switches are reported.
 		$s = SB_Auth::settings();
 		return self::respond(
 			array(
